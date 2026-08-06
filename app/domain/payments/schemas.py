@@ -64,6 +64,7 @@ class SinpeMessageCreate(BaseModel):
     Estructura idéntica a cuerpo-msj.txt más el id_pos.
     """
     id_pos: str = Field(min_length=1, max_length=64)
+    correlation_token: str = Field(min_length=1, max_length=8)
     envelope: SinpeEnvelope
     payload: SinpePayload
 

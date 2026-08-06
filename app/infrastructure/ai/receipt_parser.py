@@ -1,5 +1,5 @@
 """
-Parser de comprobantes SINPE en imagen (formato de bancos de Costa Rica).
+Parser de comprobantes SINPE en imagen (formato BCR - Banco de Costa Rica).
 """
 
 import re
@@ -33,46 +33,46 @@ def _parse_cr_amount(raw: str) -> float | None:
 
 def _find_amount(text: str) -> float | None:
     """
-    Prioriza 'Monto transferido' (lo que efectivamente recibe el comercio),
-    luego 'Monto debitado', y como último recurso el primer monto con ₡.
+    Toma el MAYOR monto con símbolo ₡/¢ del comprobante.
+
+    Un comprobante SINPE Móvil tiene tres montos: 'Monto debitado', 'Comisión'
+    y 'Monto transferido'. En SINPE Móvil la comisión es ₡0, así que
+    debitado == transferido == el mayor, y la comisión (0) es el menor.
+    Quedarnos con el máximo es robusto al orden y a la AGRUPACIÓN de etiquetas
+    que a veces hace el OCR (p. ej. "Comisión Monto transferido Motivo" seguido
+    de los tres valores), donde anclar a la etiqueta agarraba el ₡0,00 por error.
     """
-    patterns = [
-        r"Monto\s+transferido[\s\S]{0,40}?[₡¢]\s*([\d.,]+)",
-        r"Monto\s+debitado[\s\S]{0,40}?[₡¢]\s*([\d.,]+)",
-        r"[₡¢]\s*([\d.,]+)",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            amount = _parse_cr_amount(m.group(1))
-            if amount is not None:
-                return amount
-    return None
+    amounts: list[float] = []
+    for m in re.finditer(r"[₡¢]\s*([\d.,]+)", text):
+        value = _parse_cr_amount(m.group(1))
+        if value is not None:
+            amounts.append(value)
+    return max(amounts) if amounts else None
 
 
 def _find_reference(text: str) -> str | None:
-    """Número de referencia completo (puede tener más de 20 dígitos)."""
+    """
+    Número de referencia del comprobante.
+
+    La referencia SINPE es un número largo (~22-26 dígitos) que arranca con el
+    año (20XX, porque empieza con la fecha YYYYMMDD). La buscamos por ese patrón
+    y NO por adyacencia a la etiqueta "Referencia", porque el OCR a veces separa
+    la etiqueta de su valor (lo deja en otra línea, junto al número de cuenta).
+    """
+    # 1. Número largo que arranca con el año → patrón típico de referencia SINPE
+    year_refs = re.findall(r"\b(20\d{18,30})\b", text)
+    if year_refs:
+        return max(year_refs, key=len)
+
+    # 2. Respaldo: pegado a la etiqueta "Referencia" (layout limpio)
     m = re.search(r"Referencia[\s:#]*([0-9]{6,40})", text, re.IGNORECASE)
-    return m.group(1) if m else None
-
-
-def _find_phone(text: str) -> str | None:
-    """
-    Teléfono SINPE Móvil del destino (8 dígitos, formato 8670-8452).
-    En estos comprobantes el origen es una cuenta, no un teléfono; el único
-    teléfono presente suele ser el del destinatario.
-    """
-    m = re.search(
-        r"SINPE\s+M[oó]vil\s+destino[\s\S]{0,60}?(\d{4})[-\s]?(\d{4})",
-        text,
-        re.IGNORECASE,
-    )
     if m:
-        return m.group(1) + m.group(2)
-    # Respaldo: teléfono con prefijo +506
-    m = re.search(r"\+?506[-\s]?(\d{4})[-\s]?(\d{4})", text)
-    if m:
-        return m.group(1) + m.group(2)
+        return m.group(1)
+
+    # 3. Último recurso: el run de dígitos más largo y suficientemente largo
+    runs = re.findall(r"\d{20,40}", text)
+    if runs:
+        return max(runs, key=len)
     return None
 
 
@@ -133,11 +133,19 @@ def _find_bank(text: str) -> str | None:
 
 
 def parse_receipt(text: str) -> ParsedSinpeData:
-    """Extrae los campos estructurados de un comprobante SINPE en imagen."""
+    """
+    Extrae los campos estructurados de un comprobante SINPE en imagen (BCR).
+
+    No se extrae `sender_phone`: en los comprobantes BCR el único teléfono
+    presente es el "SINPE Móvil destino" (el comercio que recibe el pago),
+    no el del remitente. Incluirlo aquí causaría que `rule_phone` compare
+    el teléfono del comercio contra el `correlation_token` del cliente,
+    lo cual nunca coincide.
+    """
     return ParsedSinpeData(
         amount=_find_amount(text),
         sender_name=_find_name(text),
-        sender_phone=_find_phone(text),
+        sender_phone=None,
         reference=_find_reference(text),
         bank=_find_bank(text),
         transaction_at=_find_datetime(text),

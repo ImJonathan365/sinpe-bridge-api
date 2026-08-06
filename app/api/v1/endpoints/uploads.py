@@ -53,7 +53,7 @@ async def upload_receipt(
             correlation_id=correlation_id or trace_context.correlation_id,
             message_id=message_id,
         )
-
+        
         logger.info(
             f"Receipt uploaded: upload_id={response.upload_id}, "
             f"size={response.file_size}, correlation_id={trace_context.correlation_id}"
@@ -82,38 +82,43 @@ async def upload_receipt(
 async def analyze_receipt(
     file: UploadFile = File(...),
     id_pos: str = Form(...),
+    correlation_token: str = Form(...),
     device_id: str = Form(...),
-    correlation_id: str = Form(...),
+    correlation_id: Optional[str] = Form(None),
     message_id: Optional[str] = Form(None),
     analyzer: SinpeImageAnalyzer = Depends(get_image_analyzer),
 ):
     """
     Flujo completo: imagen → OCR → extracción → conciliación.
-
+ 
     - **file**: imagen del comprobante (JPEG, PNG, WebP, PDF)
     - **id_pos**: identificador del POS (para buscar la orden)
+    - **correlation_token**: token que asocia la imagen a la orden y al SMS
     - **device_id**: identificador del dispositivo
-    - **correlation_id**: ID de trazabilidad
+    - **correlation_id**: ID de trazabilidad (opcional, se usa el del trace si no se envía)
     - **message_id**: ID de mensaje relacionado (opcional)
     """
+    trace_context = get_trace_context()
+ 
     if not settings.ENABLE_OCR_PIPELINE:
         raise HTTPException(
             status_code=503,
             detail="El pipeline de OCR está deshabilitado (ENABLE_OCR_PIPELINE=False).",
         )
-
+ 
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="File is empty")
-
+ 
     try:
         return await analyzer.analyze(
             file_content=content,
             filename=file.filename or "receipt.jpg",
             mime_type=file.content_type or "image/jpeg",
             id_pos=id_pos,
+            correlation_token=correlation_token,
             device_id=device_id,
-            correlation_id=correlation_id,
+            correlation_id=correlation_id or trace_context.correlation_id,
             message_id=message_id,
         )
     except ValueError as e:

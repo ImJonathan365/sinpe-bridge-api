@@ -1,61 +1,43 @@
-import re
 from datetime import datetime, timezone
-from difflib import SequenceMatcher
 
 from app.domain.payments.schemas import ParsedSinpeData
 from app.infrastructure.db.models import PurchaseOrder as PurchaseOrderModel
 from app.shared.constants import (
+    APPROVAL_SCORE_THRESHOLD,
     MAX_AMOUNT_DIFF,
-    NAME_SIMILARITY_THRESHOLD,
     PAYMENT_EXPIRY_MINUTES,
+    SCORE_BASE_HARD_RULES,
+    SCORE_OCR_CONFIDENCE,
+    SCORE_SENDER_NAME_PRESENT,
 )
 from app.shared.enums import ReconciliationResult
 
 
 # Funciones individuales de cada regla
 
+
 def rule_amount(
     order: PurchaseOrderModel, parsed: ParsedSinpeData
 ) -> tuple[bool, str]:
-    """El monto pagado debe coincidir exactamente con el monto de la orden"""
+    """El monto del comprobante debe coincidir exactamente con el monto de la orden."""
     if parsed.amount is None:
-        return False, "No se pudo extraer el monto del SMS"
+        return False, "No se pudo extraer el monto del comprobante"
     diff = abs(float(order.amount) - parsed.amount)
     if diff > MAX_AMOUNT_DIFF:
         return (
             False,
-            f"Monto no coincide: orden={order.amount}, pago={parsed.amount}",
+            f"Monto no coincide: orden={order.amount}, comprobante={parsed.amount}",
         )
     return True, "El monto coincide"
-
-
-def rule_phone(
-    order: PurchaseOrderModel, parsed: ParsedSinpeData
-) -> tuple[bool, str]:
-    """
-    El teléfono debe coincidir con el
-    correlation_token de la orden (teléfono del cliente registrado en el POS).
-    """
-    if not order.correlation_token or not parsed.sender_phone:
-        return True, "Verificación de teléfono omitida (datos insuficientes)"
-
-    order_phone = re.sub(r"\D", "", order.correlation_token)[-8:]
-    sms_phone = re.sub(r"\D", "", parsed.sender_phone)[-8:]
-
-    if order_phone != sms_phone:
-        return False, f"Teléfono no coincide: orden={order_phone}, sms={sms_phone}"
-    return True, "El teléfono coincide"
 
 
 def rule_time_window(
     order: PurchaseOrderModel, parsed: ParsedSinpeData
 ) -> tuple[bool, str]:
-    """
-    El timestamp del pago debe estar dentro de la ventana de tiempo válida
-    """
+    """El timestamp del comprobante debe estar dentro de la ventana de tiempo válida."""
     if parsed.transaction_at is None:
         # Sin timestamp no se puede verificar, se deja pasar (regla blanda)
-        return True, "Verificación de tiempo omitida (el SMS no tiene timestamp)"
+        return True, "Verificación de tiempo omitida (el comprobante no tiene fecha/hora)"
 
     reference_time = order.ordered_at.replace(tzinfo=timezone.utc) if order.ordered_at.tzinfo is None else order.ordered_at
 
@@ -68,91 +50,110 @@ def rule_time_window(
 
     tx_time = parsed.transaction_at
     if tx_time < reference_time:
-        return False, "El timestamp del pago es anterior a la creación de la orden"
+        return False, "La fecha/hora del comprobante es anterior a la creación de la orden"
     if tx_time > deadline:
         return (
             False,
-            f"El pago está fuera de la ventana de {PAYMENT_EXPIRY_MINUTES} minutos",
+            f"El comprobante está fuera de la ventana de {PAYMENT_EXPIRY_MINUTES} minutos",
         )
-    return True, "El pago está dentro de la ventana de tiempo válida"
-
-
-def rule_name_similarity(
-    order: PurchaseOrderModel, parsed: ParsedSinpeData
-) -> tuple[bool, str]:
-    """
-    Si el SMS contiene el nombre del pagador, se compara con los datos de la orden.
-    """
-    if parsed.sender_name is None:
-        return True, "Verificación de nombre omitida (el SMS no contiene nombre)"
-    return True, f"Nombre del pagador en el SMS: {parsed.sender_name}"
+    return True, "El comprobante está dentro de la ventana de tiempo válida"
 
 
 def rule_reference_unique(reference: str | None, already_used: bool) -> tuple[bool, str]:
     """El número de referencia SINPE no debe haber sido usado antes."""
     if reference is None:
-        return True, "Verificación de referencia omitida (el SMS no tiene referencia)"
+        return False, "No se pudo extraer la referencia del comprobante"
     if already_used:
         return False, f"La referencia {reference} ya fue usada (pago duplicado)"
     return True, "La referencia es única"
 
 
+def rule_ocr_confidence(ocr_confidence: float | None, min_confidence: float) -> tuple[bool, str]:
+    """La confianza del OCR debe ser razonablemente alta."""
+    if ocr_confidence is None:
+        return False, "El OCR no devolvió un valor de confianza"
+    if ocr_confidence < min_confidence:
+        return False, f"Confianza de OCR baja ({ocr_confidence:.2f} < {min_confidence})"
+    return True, f"Confianza de OCR aceptable ({ocr_confidence:.2f})"
+
+
+def rule_sender_name_present(parsed: ParsedSinpeData) -> tuple[bool, str]:
+    """El comprobante debe contener un nombre de remitente legible."""
+    if parsed.sender_name:
+        return True, f"Nombre del remitente extraído: {parsed.sender_name}"
+    return False, "No se pudo extraer el nombre del remitente del comprobante"
+
+
 # Motor de conciliación
-
-
-def _name_ratio(a: str, b: str) -> float:
-    """Calcula el porcentaje de similitud entre dos nombres (0.0 a 1.0)."""
-    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 
 class ReconciliationEngine:
     """
-    Ejecuta todas las reglas contra una orden y los datos del SMS,
-    y retorna el resultado final con una explicación.
+    Ejecuta las reglas duras (monto, referencia, ventana de tiempo) contra una
+    orden y los datos extraídos del comprobante en imagen. Si todas pasan,
+    calcula un puntaje de 0 a 100 con las reglas blandas (confianza del OCR,
+    presencia de nombre del remitente) para decidir entre APPROVED y
+    UNDER_REVIEW.
     """
+
+    def __init__(self, ocr_min_confidence: float) -> None:
+        self._ocr_min_confidence = ocr_min_confidence
 
     def evaluate(
         self,
         order: PurchaseOrderModel,
         parsed: ParsedSinpeData,
         reference_already_used: bool = False,
-    ) -> tuple[ReconciliationResult, str]:
+        ocr_confidence: float | None = None,
+    ) -> tuple[ReconciliationResult, str, int]:
+        """
+        Devuelve (resultado, detalle, score). El score es 0 si el flujo corta
+        por una regla dura (REJECTED / DUPLICATE / EXPIRED).
+        """
 
-        reasons: list[str] = []
-        soft_failures: list[str] = []
-
-        # REGLA DURA: referencia duplicada
+        # REGLA DURA: referencia única
         passed, reason = rule_reference_unique(parsed.reference, reference_already_used)
         if not passed:
-            return ReconciliationResult.DUPLICATE, reason
+            result = (
+                ReconciliationResult.DUPLICATE
+                if reference_already_used
+                else ReconciliationResult.REJECTED
+            )
+            return result, reason, 0
 
         # REGLA DURA: monto
         passed, reason = rule_amount(order, parsed)
-        reasons.append(reason)
         if not passed:
-            return ReconciliationResult.REJECTED, reason
+            return ReconciliationResult.REJECTED, reason, 0
 
         # REGLA DURA: ventana de tiempo
         passed, reason = rule_time_window(order, parsed)
-        reasons.append(reason)
         if not passed:
-            return ReconciliationResult.EXPIRED, reason
+            return ReconciliationResult.EXPIRED, reason, 0
 
-        # REGLA BLANDA: teléfono
-        passed, reason = rule_phone(order, parsed)
+        # Reglas duras superadas: puntaje base
+        score = SCORE_BASE_HARD_RULES
+        reasons = [
+            "El monto coincide",
+            "La referencia es única",
+            "El comprobante está dentro de la ventana de tiempo válida",
+        ]
+
+        # REGLA BLANDA: confianza del OCR
+        passed, reason = rule_ocr_confidence(ocr_confidence, self._ocr_min_confidence)
         reasons.append(reason)
-        if not passed:
-            soft_failures.append(reason)
+        if passed:
+            score += SCORE_OCR_CONFIDENCE
 
-        # REGLA BLANDA: similitud de nombre
-        passed, reason = rule_name_similarity(order, parsed)
+        # REGLA BLANDA: nombre del remitente presente
+        passed, reason = rule_sender_name_present(parsed)
         reasons.append(reason)
-        if not passed:
-            soft_failures.append(reason)
+        if passed:
+            score += SCORE_SENDER_NAME_PRESENT
 
-        # decisión final
-        if soft_failures:
-            detail = "Requiere revisión manual. Problemas: " + "; ".join(soft_failures)
-            return ReconciliationResult.UNDER_REVIEW, detail
+        detail = f"Puntaje: {score}/100. " + "; ".join(reasons)
 
-        return ReconciliationResult.APPROVED, "Todas las verificaciones pasaron: " + "; ".join(reasons)
+        if score >= APPROVAL_SCORE_THRESHOLD:
+            return ReconciliationResult.APPROVED, detail, score
+
+        return ReconciliationResult.UNDER_REVIEW, detail, score

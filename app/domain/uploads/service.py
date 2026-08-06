@@ -104,11 +104,13 @@ class UploadService:
             )
 
         receipt = await self._upload_repo.create_receipt(
+            upload_id=upload_id,
             correlation_session_id=session.id,
             id_pos=id_pos,
             image_url=str(file_path.relative_to(self.storage_path)),
             image_storage_path=str(file_path.relative_to(self.storage_path)),
             image_hash=file_hash,
+            file_hash=file_hash,
             mime_type=mime_type,
             image_size_bytes=file_size,
             device_id=device_id,
