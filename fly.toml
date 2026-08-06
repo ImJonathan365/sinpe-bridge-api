@@ -1,10 +1,10 @@
-# fly.toml app configuration file generated for sinpe-bridge-api on 2026-06-03T00:32:44Z
+# fly.toml app configuration file generated for sinpe-bridge-api on 2026-08-06T05:17:20Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
 app = 'sinpe-bridge-api'
-primary_region = 'iad'
+primary_region = 'dfw'
 
 [build]
 
